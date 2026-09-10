@@ -58,13 +58,51 @@ def _health_value(payload: Any) -> str:
     return "ok"
 
 
+def _json_get(url: str, timeout: float) -> Any:
+    req = urllib.request.Request(url, method="GET", headers={"User-Agent": "UNG-ORION-Diagnostics/2.1"})
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        body = response.read().decode("utf-8", errors="replace")
+        return json.loads(body) if body else {}
+
+
+def _internalnet_result(base_url: str, timeout: float) -> dict[str, Any] | None:
+    try:
+        telemetry = _json_get(base_url.rstrip("/") + "/api/telemetry/current", timeout)
+    except Exception:
+        return None
+    alarms = telemetry.get("alarms") if isinstance(telemetry, dict) else None
+    if not alarms:
+        return None
+    severity_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "normal": 0}
+    alarm = sorted(alarms, key=lambda x: severity_rank.get(str(x.get("severity", "")), 0), reverse=True)[0]
+    code = alarm.get("d_code") or alarm.get("code")
+    fault_number = str(alarm.get("fault_number") or "901")
+    return {
+        "code": code or f"D-802-{fault_number}",
+        "d_code": code or f"D-802-{fault_number}",
+        "legacy_u_code": alarm.get("legacy_u_code"),
+        "system_number": "802",
+        "system": "UNG-INTERNALNET",
+        "domain": "internal-network",
+        "fault": fault_number,
+        "title": alarm.get("fault", "InternalNet alarm"),
+        "severity": alarm.get("severity", "medium"),
+        "layer": "network",
+        "probable_cause": alarm.get("detail", "InternalNet telemetry reported a fault"),
+        "action": "Inspect the reported InternalNet location and telemetry",
+        "location": alarm.get("location"),
+        "telemetry": telemetry,
+        "target": base_url,
+    }
+
+
 def _probe_once(system: str, base_url: str, timeout: float) -> dict[str, Any]:
     started = time.perf_counter()
     url = base_url.rstrip("/") + "/health"
     observation: dict[str, Any] = {"target": base_url}
     payload: Any = None
     try:
-        req = urllib.request.Request(url, method="GET", headers={"User-Agent": "UNG-ORION-Diagnostics/2.0"})
+        req = urllib.request.Request(url, method="GET", headers={"User-Agent": "UNG-ORION-Diagnostics/2.1"})
         with urllib.request.urlopen(req, timeout=timeout) as response:
             body = response.read().decode("utf-8", errors="replace")
             lower_body = body.lower()
@@ -88,6 +126,10 @@ def _probe_once(system: str, base_url: str, timeout: float) -> dict[str, Any]:
     result = diagnose(system, observation)
     result["target"] = base_url
     result["payload"] = payload
+    if system == "UNG-INTERNALNET" and result.get("fault") in {"000", "105"}:
+        internalnet_fault = _internalnet_result(base_url, timeout)
+        if internalnet_fault:
+            return internalnet_fault
     return result
 
 
@@ -98,6 +140,8 @@ def probe(system: str, base_url: str, timeout: float = 5.0) -> dict[str, Any]:
         result["attempt"] = attempt
         last = result
         if result.get("fault") in {"000", "105"}:
+            return result
+        if system == "UNG-INTERNALNET" and result.get("telemetry"):
             return result
         if attempt < RETRY_ATTEMPTS:
             time.sleep(RETRY_DELAY_SECONDS)
