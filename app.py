@@ -5,8 +5,9 @@ from datetime import datetime, timezone
 import os, json, urllib.request, urllib.error, psycopg
 from psycopg.rows import dict_row
 from diagnostics import SYSTEMS, catalog, decode, diagnose
+from monitor import latest as diagnostic_latest, scan_all as diagnostic_scan_all, start_background as start_diagnostic_monitor, stop_background as stop_diagnostic_monitor
 
-app=FastAPI(title='UNG-ORION',description='Uganda National Grid National Operations Command',version='1.1.0')
+app=FastAPI(title='UNG-ORION',description='Uganda National Grid National Operations Command',version='1.2.0')
 DB=os.getenv('DATABASE_URL','')
 JANUS=os.getenv('JANUS_BASE_URL','https://ung-iam-production.up.railway.app').rstrip('/')
 def conn(): return psycopg.connect(DB,row_factory=dict_row)
@@ -29,6 +30,10 @@ def init():
         with conn() as c:
             c.execute('CREATE TABLE IF NOT EXISTS operational_events(id UUID PRIMARY KEY,title TEXT,event_type TEXT,severity TEXT,status TEXT,region TEXT,source_system TEXT,details TEXT,created_at TIMESTAMPTZ,updated_at TIMESTAMPTZ)')
             c.execute('CREATE TABLE IF NOT EXISTS command_actions(id UUID PRIMARY KEY,event_id UUID,action TEXT,assigned_to TEXT,status TEXT,priority TEXT,created_by TEXT,created_at TIMESTAMPTZ,completed_at TIMESTAMPTZ)')
+    start_diagnostic_monitor()
+
+@app.on_event('shutdown')
+def shutdown(): stop_diagnostic_monitor()
 
 class EventIn(BaseModel): title:str; event_type:str='operational'; severity:str='medium'; region:str='national'; source_system:str='UNG-ORION'; details:str=''
 class ActionIn(BaseModel): action:str; assigned_to:str; priority:str='normal'
@@ -36,9 +41,9 @@ class StatusIn(BaseModel): status:str
 class DiagnosticIn(BaseModel): system:str; observation:dict
 
 @app.get('/')
-def root(): return {'system':'UNG-ORION','name':'National Operations Command','status':'operational','version':'1.1.0'}
+def root(): return {'system':'UNG-ORION','name':'National Operations Command','status':'operational','version':'1.2.0'}
 @app.get('/health')
-def health(): return {'status':'ok','service':'UNG-ORION','version':'1.1.0'}
+def health(): return {'status':'ok','service':'UNG-ORION','version':'1.2.0'}
 @app.get('/ready')
 def ready():
     try:
@@ -46,7 +51,7 @@ def ready():
         return {'status':'ready','database':'connected','janus':JANUS}
     except Exception:return {'status':'degraded','database':'unavailable','janus':JANUS}
 @app.get('/v1/system')
-def system(): return {'system_id':'UNG-ORION','domain':'national-operations-command','capabilities':['common-operating-picture','operational-events','command-actions','incident-coordination','system-status','janus-auth','u-code-diagnostics']}
+def system(): return {'system_id':'UNG-ORION','domain':'national-operations-command','capabilities':['common-operating-picture','operational-events','command-actions','incident-coordination','system-status','janus-auth','u-code-diagnostics','automatic-health-monitoring']}
 
 @app.get('/v1/diagnostics/systems')
 def diagnostic_systems(): return SYSTEMS
@@ -59,6 +64,10 @@ def diagnostic_decode(code:str):
     return result
 @app.post('/v1/diagnostics/diagnose')
 def diagnostic_diagnose(b:DiagnosticIn): return diagnose(b.system,b.observation)
+@app.get('/v1/diagnostics/status')
+def diagnostic_status(): return diagnostic_latest()
+@app.post('/v1/diagnostics/scan')
+def diagnostic_scan(): return diagnostic_scan_all()
 
 @app.get('/v1/events')
 def events(authorization:str|None=Header(None)):
