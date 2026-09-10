@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from diagnostics import diagnose
+from diagnostics import FAULTS, SYSTEMS, diagnose, make_code
 
 DEFAULT_TARGETS = {
     "UNG-ATLAS": "https://ung-atlas-production.up.railway.app",
@@ -26,6 +26,7 @@ LOCK = threading.Lock()
 STOP = threading.Event()
 THREAD: threading.Thread | None = None
 HISTORY_PATH = Path(os.getenv("ORION_DIAGNOSTIC_HISTORY", "diagnostics_history.jsonl"))
+KNOWN_ISSUES_PATH = Path(os.getenv("ORION_KNOWN_ISSUES_PATH", "known_issues.json"))
 RETRY_ATTEMPTS = max(1, int(os.getenv("ORION_MONITOR_RETRIES", "3")))
 RETRY_DELAY_SECONDS = max(0.0, float(os.getenv("ORION_MONITOR_RETRY_DELAY_SECONDS", "1.5")))
 
@@ -58,51 +59,14 @@ def _health_value(payload: Any) -> str:
     return "ok"
 
 
-def _json_get(url: str, timeout: float) -> Any:
-    req = urllib.request.Request(url, method="GET", headers={"User-Agent": "UNG-ORION-Diagnostics/2.1"})
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        body = response.read().decode("utf-8", errors="replace")
-        return json.loads(body) if body else {}
-
-
-def _internalnet_result(base_url: str, timeout: float) -> dict[str, Any] | None:
-    try:
-        telemetry = _json_get(base_url.rstrip("/") + "/api/telemetry/current", timeout)
-    except Exception:
-        return None
-    alarms = telemetry.get("alarms") if isinstance(telemetry, dict) else None
-    if not alarms:
-        return None
-    severity_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "normal": 0}
-    alarm = sorted(alarms, key=lambda x: severity_rank.get(str(x.get("severity", "")), 0), reverse=True)[0]
-    code = alarm.get("d_code") or alarm.get("code")
-    fault_number = str(alarm.get("fault_number") or "901")
-    return {
-        "code": code or f"D-802-{fault_number}",
-        "d_code": code or f"D-802-{fault_number}",
-        "legacy_u_code": alarm.get("legacy_u_code"),
-        "system_number": "802",
-        "system": "UNG-INTERNALNET",
-        "domain": "internal-network",
-        "fault": fault_number,
-        "title": alarm.get("fault", "InternalNet alarm"),
-        "severity": alarm.get("severity", "medium"),
-        "layer": "network",
-        "probable_cause": alarm.get("detail", "InternalNet telemetry reported a fault"),
-        "action": "Inspect the reported InternalNet location and telemetry",
-        "location": alarm.get("location"),
-        "telemetry": telemetry,
-        "target": base_url,
-    }
-
-
 def _probe_once(system: str, base_url: str, timeout: float) -> dict[str, Any]:
     started = time.perf_counter()
-    url = base_url.rstrip("/") + "/health"
+    path = "/api/telemetry/current" if system == "UNG-INTERNALNET" else "/health"
+    url = base_url.rstrip("/") + path
     observation: dict[str, Any] = {"target": base_url}
     payload: Any = None
     try:
-        req = urllib.request.Request(url, method="GET", headers={"User-Agent": "UNG-ORION-Diagnostics/2.1"})
+        req = urllib.request.Request(url, method="GET", headers={"User-Agent": "UNG-ORION-Diagnostics/2.0"})
         with urllib.request.urlopen(req, timeout=timeout) as response:
             body = response.read().decode("utf-8", errors="replace")
             lower_body = body.lower()
@@ -114,6 +78,16 @@ def _probe_once(system: str, base_url: str, timeout: float) -> dict[str, Any]:
             observation["health"] = _health_value(payload)
             if "in-memory" in lower_body or "fallback" in lower_body:
                 observation["mode"] = "fallback"
+            if system == "UNG-INTERNALNET" and isinstance(payload, dict):
+                alarms = payload.get("alarms") or []
+                if alarms:
+                    first = alarms[0]
+                    code = str(first.get("d_code") or first.get("code") or "")
+                    parts = code.split("-")
+                    if len(parts) == 3:
+                        observation["internalnet_fault"] = parts[2]
+                        observation["internalnet_alarm"] = first
+                        observation["health"] = "degraded"
     except urllib.error.HTTPError as exc:
         observation["http_status"] = exc.code
         observation["error"] = f"HTTP {exc.code}: {exc.reason}"
@@ -124,12 +98,20 @@ def _probe_once(system: str, base_url: str, timeout: float) -> dict[str, Any]:
     observation["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
     observation["checked_at"] = datetime.now(timezone.utc).isoformat()
     result = diagnose(system, observation)
+    if system == "UNG-INTERNALNET" and observation.get("internalnet_fault") in FAULTS:
+        fault_id = observation["internalnet_fault"]
+        f = FAULTS[fault_id]
+        result.update({
+            "code": make_code("802", fault_id),
+            "fault": fault_id,
+            "title": f.title,
+            "severity": f.severity,
+            "layer": f.layer,
+            "probable_cause": f.probable_cause,
+            "action": f.action,
+        })
     result["target"] = base_url
     result["payload"] = payload
-    if system == "UNG-INTERNALNET" and result.get("fault") in {"000", "105"}:
-        internalnet_fault = _internalnet_result(base_url, timeout)
-        if internalnet_fault:
-            return internalnet_fault
     return result
 
 
@@ -141,14 +123,52 @@ def probe(system: str, base_url: str, timeout: float = 5.0) -> dict[str, Any]:
         last = result
         if result.get("fault") in {"000", "105"}:
             return result
-        if system == "UNG-INTERNALNET" and result.get("telemetry"):
-            return result
         if attempt < RETRY_ATTEMPTS:
             time.sleep(RETRY_DELAY_SECONDS)
     assert last is not None
     last["retry_exhausted"] = RETRY_ATTEMPTS > 1
     last["attempts"] = RETRY_ATTEMPTS
     return last
+
+
+def _load_known_issues() -> list[dict[str, Any]]:
+    try:
+        data = json.loads(KNOWN_ISSUES_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    raw = data.get("issues", {}) if isinstance(data, dict) else {}
+    out: list[dict[str, Any]] = []
+    for system_number, entries in raw.items():
+        system = SYSTEMS.get(str(system_number))
+        if not system or not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            fault_id = str(entry.get("fault") or "905")
+            if fault_id not in FAULTS:
+                fault_id = "905"
+            fault = FAULTS[fault_id]
+            out.append({
+                "code": make_code(str(system_number), fault_id),
+                "system_number": str(system_number),
+                "system": system["name"],
+                "domain": system["domain"],
+                "fault": fault_id,
+                "title": fault.title,
+                "severity": str(entry.get("severity") or fault.severity),
+                "layer": fault.layer,
+                "probable_cause": str(entry.get("note") or fault.probable_cause),
+                "action": str(entry.get("action") or fault.action),
+                "manual": True,
+                "recorded_at": entry.get("recorded_at"),
+            })
+    return out
+
+
+def known_issues() -> dict[str, Any]:
+    issues = _load_known_issues()
+    return {"count": len(issues), "issues": issues}
 
 
 def _append_history(report: dict[str, Any]) -> None:
@@ -159,13 +179,30 @@ def _append_history(report: dict[str, Any]) -> None:
         pass
 
 
+def history(limit: int = 50) -> dict[str, Any]:
+    limit = max(1, min(int(limit), 500))
+    try:
+        lines = HISTORY_PATH.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        lines = []
+    reports: list[dict[str, Any]] = []
+    for line in lines[-limit:]:
+        try:
+            reports.append(json.loads(line))
+        except Exception:
+            continue
+    return {"count": len(reports), "limit": limit, "reports": reports}
+
+
 def scan_all() -> dict[str, Any]:
     configured = targets()
     results = [probe(system, url) for system, url in configured.items()]
     with LOCK:
         LATEST.clear()
         LATEST.update({item["system"]: item for item in results})
-    faults = [item for item in results if item.get("fault") != "000"]
+    live_faults = [item for item in results if item.get("fault") != "000"]
+    manual_faults = _load_known_issues()
+    faults = live_faults + manual_faults
     severity_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
     faults.sort(key=lambda x: severity_rank.get(str(x.get("severity")), 0), reverse=True)
     report = {
@@ -173,6 +210,8 @@ def scan_all() -> dict[str, Any]:
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "configured_systems": len(configured),
         "fault_count": len(faults),
+        "live_fault_count": len(live_faults),
+        "manual_issue_count": len(manual_faults),
         "faults": faults,
         "systems": results,
     }
@@ -183,10 +222,15 @@ def scan_all() -> dict[str, Any]:
 def latest() -> dict[str, Any]:
     with LOCK:
         systems = list(LATEST.values())
-    faults = [item for item in systems if item.get("fault") != "000"]
+    live_faults = [item for item in systems if item.get("fault") != "000"]
+    manual_faults = _load_known_issues()
+    faults = live_faults + manual_faults
     return {
         "status": "faults_detected" if faults else ("healthy" if systems else "not_scanned"),
         "fault_count": len(faults),
+        "live_fault_count": len(live_faults),
+        "manual_issue_count": len(manual_faults),
+        "faults": faults,
         "systems": systems,
     }
 
