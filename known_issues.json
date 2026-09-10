@@ -1,0 +1,4 @@
+{
+  "_comment": "Manual diagnostic issues that live probes cannot detect. Key by current 3-digit ORION system number. Each issue may provide fault and note. Leave empty until an issue is confirmed.",
+  "issues": {}
+}
